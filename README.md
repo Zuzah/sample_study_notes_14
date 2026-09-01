@@ -688,3 +688,37 @@ def test_connect_uses_passed_connection_details_when_given(
     ]
 
 ```
+
+dag
+
+```python
+from datetime import datetime
+
+from airflow.decorators import dag
+from airflow.operators.bash import BashOperator
+
+REPORT_NAME = "ChinaGTTReport"  # <- change this per report
+
+
+@dag(schedule=None, start_date=datetime(2026, 1, 1), catchup=False)
+def run_report_full():
+    # DO NOT set retries= on this task. `run-report` submits a NEW request to
+    # Fenergo every time it runs - if Airflow retries it after a failure, it may
+    # resubmit even though the first attempt already succeeded (a real duplicate
+    # Fenergo submission, not just a duplicate log line). No idempotency guard
+    # exists for this yet - see docs/architecture.md Sec 4.
+    #
+    # To retry a failed run safely, use airflow_dag_stage_level.py's
+    # poll/download/transform tasks instead (each resumable via execution_id),
+    # or fix it manually:
+    #   python -m app.cli poll <execution_id>
+    #   python -m app.cli download <execution_id> <presigned_url>
+    #   python -m app.cli transform <execution_id>
+    BashOperator(
+        task_id="run_report",
+        bash_command=f"python -m app.cli run-report {REPORT_NAME}",
+    )
+
+
+run_report_full()
+```
