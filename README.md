@@ -1,695 +1,8 @@
 # sample_study_notes_14
 KYC Stuides
 
-delivery service
 
-```python
-import errno
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Callable, Optional, Protocol
-
-import paramiko
-from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
-
-from app.core.config import settings
-from app.core.logging import log
-
-
-class DeliveryConfigError(Exception):
-    """Raised when required SFTP settings (host/credentials/known_hosts) are missing
-    or invalid - a configuration problem, not a transient delivery failure."""
-
-
-class DeliveryError(Exception):
-    """Raised when an SFTP delivery attempt fails in a way that's potentially
-    transient - e.g. the uploaded file's remote size doesn't match the local one."""
-
-
-class DeliveryAuthenticationError(DeliveryError):
-    """Raised when the SFTP server rejects the configured credentials. Not retried -
-    a bad key/username won't fix itself on a second attempt."""
-
-
-class DeliveryUnavailableError(DeliveryError):
-    """Raised when the SFTP server can't be reached after exhausting retries (connection
-    refused, timeout, DNS failure, etc.)."""
-
-
-class DeliveryCollisionError(DeliveryError):
-    """Raised when the final remote filename already exists with a DIFFERENT size than
-    what was just uploaded - a real, non-transient naming collision (not the same file
-    redelivered - see the idempotent-redelivery handling in _attempt_delivery). Not
-    retried: retrying a genuine collision just fails the same way every time."""
-
-
-class DeliveryRemoteDirectoryNotFoundError(DeliveryError):
-    """Raised when the SFTP server rejects an upload because the destination directory
-    doesn't exist yet on the server (surfaces from paramiko as a plain OSError with
-    errno.ENOENT - identical to a missing local file, see docs/decisions.md 2026-08-27,
-    which is why this is only detected at the upload call specifically, not via the
-    generic OSError/SSHException catch in deliver()). A permanent misconfiguration, not
-    a transient failure, so not retried - the landing-zone folder must be created on
-    the server first; delivery_service.py never creates remote directories itself."""
-
-
-class SFTPClientLike(Protocol):
-    def put(self, localpath: str, remotepath: str, confirm: bool = True) -> object: ...
-    def stat(self, remotepath: str) -> object: ...
-    def rename(self, oldpath: str, newpath: str) -> None: ...
-    def remove(self, remotepath: str) -> None: ...
-    def close(self) -> None: ...
-
-
-@dataclass
-class DeliveryResult:
-    remote_path: str
-    size_bytes: int
-    delivered_at: datetime
-
-
-@dataclass
-class SFTPConnectionSettings:
-    """Resolved, ready-to-use connection details for one named SFTP destination -
-    lives here (not in sftp_connection_service.py) so that module can import
-    DeliveryConfigError from here without a circular import; this is the shape
-    deliver()'s optional `connection` argument expects."""
-
-    host: str
-    port: int
-    username: str
-    private_key_path: str
-    known_hosts_path: Path
-    remote_folder: str
-
-
-def _is_retryable(exc: BaseException) -> bool:
-    if isinstance(
-        exc, (paramiko.AuthenticationException, paramiko.BadHostKeyException)
-    ):
-        return False
-    if isinstance(exc, (DeliveryCollisionError, DeliveryRemoteDirectoryNotFoundError)):
-        # Checked before the general DeliveryError case below, since both are
-        # subclasses - neither a genuine collision nor a missing remote directory
-        # can resolve itself on retry.
-        return False
-    if isinstance(exc, DeliveryError):
-        return True
-    return isinstance(exc, (paramiko.SSHException, OSError))
-
-
-class DeliveryService:
-    """Delivers a local file to an enterprise SFTP landing zone via paramiko. Does NOT
-    transform, poll, or call Fenergo's own API - see CLAUDE.md service boundaries.
-    """
-
-    def __init__(self, client_factory: Optional[Callable[[], SFTPClientLike]] = None):
-        self._test_client_factory = client_factory
-
-    def _require_setting(self, name: str) -> str:
-        value = getattr(settings, name)
-        if not value:
-            raise DeliveryConfigError(f"{name} must be set to use SFTP delivery")
-        return value
-
-    def _connect(
-        self, connection: Optional[SFTPConnectionSettings] = None
-    ) -> SFTPClientLike:
-        if self._test_client_factory is not None:
-            return self._test_client_factory()
-
-        if connection is not None:
-            host = connection.host
-            port = connection.port
-            username = connection.username
-            key_path = connection.private_key_path
-            known_hosts_path = connection.known_hosts_path
-        else:
-            host = self._require_setting("SFTP_HOST")
-            username = self._require_setting("SFTP_USERNAME")
-            key_path = self._require_setting("SFTP_PRIVATE_KEY_PATH")
-            port = settings.SFTP_PORT
-            known_hosts_path = settings.known_hosts_path
-
-        if not Path(key_path).exists():
-            raise DeliveryConfigError(
-                f"SFTP private key file not found at {key_path} - check "
-                "SFTP_PRIVATE_KEY_PATH (or the connection's own "
-                "*_PRIVATE_KEY_PATH env var, see sftp_connection_service.py)"
-            )
-
-        if not known_hosts_path.exists():
-            raise DeliveryConfigError(
-                f"SFTP known_hosts file not found at {known_hosts_path} - refusing to "
-                "connect without host-key verification (see docs/decisions.md)"
-            )
-
-        client = paramiko.SSHClient()
-        client.load_host_keys(str(known_hosts_path))
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        client.connect(
-            hostname=host,
-            port=port,
-            username=username,
-            key_filename=key_path,
-            timeout=settings.SFTP_CONNECT_TIMEOUT_SECONDS,
-        )
-        return client.open_sftp()
-
-    def deliver(
-        self,
-        local_path: Path,
-        remote_directory: str,
-        remote_filename: Optional[str] = None,
-        connection: Optional[SFTPConnectionSettings] = None,
-    ) -> DeliveryResult:
-        """connection (optional, net new 2026-08-24): which named SFTP destination
-        to use (see sftp_connection_service.py) - report-driven flows resolve this
-        from ReportDefinition.sftp_connection. None (default) keeps the legacy
-        behavior: the single global SFTP_HOST/SFTP_PORT/SFTP_USERNAME/
-        SFTP_PRIVATE_KEY_PATH settings, unchanged - used by deliver_file() (the
-        raw `deliver` CLI command), which has no report/connection context."""
-        local_size = local_path.stat().st_size
-
-        remote_filename = remote_filename or local_path.name
-        final_remote_path = f"{remote_directory.rstrip('/')}/{remote_filename}"
-        temp_remote_path = f"{final_remote_path}.part"
-
-        log_host = connection.host if connection is not None else settings.SFTP_HOST
-        log_username = (
-            connection.username if connection is not None else settings.SFTP_USERNAME
-        )
-        log_port = connection.port if connection is not None else settings.SFTP_PORT
-
-        try:
-            for attempt in Retrying(
-                retry=retry_if_exception(_is_retryable),
-                stop=stop_after_attempt(settings.SFTP_RETRY_COUNT),
-                wait=wait_exponential(multiplier=1, min=1, max=10),
-                reraise=True,
-            ):
-                with attempt:
-                    self._attempt_delivery(
-                        local_path,
-                        temp_remote_path,
-                        final_remote_path,
-                        local_size,
-                        connection,
-                    )
-        except paramiko.AuthenticationException as exc:
-            raise DeliveryAuthenticationError(
-                f"SFTP authentication failed for {log_username}@{log_host}: {exc}"
-            ) from exc
-        except paramiko.BadHostKeyException:
-            # Security-relevant server-identity mismatch - a distinct concern from bad
-            # credentials or an unreachable server, surfaced as-is rather than wrapped.
-            raise
-        except (OSError, paramiko.SSHException) as exc:
-            raise DeliveryUnavailableError(
-                f"SFTP server {log_host}:{log_port} unavailable after "
-                f"{settings.SFTP_RETRY_COUNT} attempt(s): {exc}"
-            ) from exc
-
-        delivered_at = datetime.now(timezone.utc)
-        log.info(f"Delivered {local_path} to {final_remote_path} ({local_size} bytes)")
-        return DeliveryResult(
-            remote_path=final_remote_path,
-            size_bytes=local_size,
-            delivered_at=delivered_at,
-        )
-
-    def _attempt_delivery(
-        self,
-        local_path: Path,
-        temp_remote_path: str,
-        final_remote_path: str,
-        local_size: int,
-        connection: Optional[SFTPConnectionSettings] = None,
-    ) -> None:
-        sftp = self._connect(connection)
-        try:
-            try:
-                sftp.put(str(local_path), temp_remote_path, confirm=True)
-            except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    # Indistinguishable from a missing local file by errno/message
-                    # alone (both are "[Errno 2] No such file") - but this one is
-                    # raised specifically from the upload call itself, after
-                    # _connect() already succeeded, so it can only be the remote
-                    # side. See docs/decisions.md 2026-08-27.
-                    raise DeliveryRemoteDirectoryNotFoundError(
-                        f"Remote directory not found while uploading to "
-                        f"{temp_remote_path} - the destination folder doesn't "
-                        "exist yet on the SFTP server and must be created there "
-                        "first (delivery_service.py never creates it)"
-                    ) from exc
-                raise
-            remote_size = sftp.stat(temp_remote_path).st_size
-            if remote_size != local_size:
-                raise DeliveryError(
-                    f"Uploaded size {remote_size} does not match local size {local_size} "
-                    f"for {temp_remote_path}"
-                )
-            try:
-                sftp.rename(temp_remote_path, final_remote_path)
-            except OSError as rename_exc:
-                # Real SFTP servers (including atmoz/sftp's OpenSSH-based
-                # sftp-server, confirmed live) refuse SSH_FXP_RENAME onto an
-                # existing destination. If it's the exact same content already
-                # delivered - e.g. an Airflow task retry after the first attempt
-                # actually succeeded - treat this as done, not a failure. Only
-                # compares size, not a checksum: proportionate for "the same
-                # upload retried," not a general integrity guarantee - a true
-                # collision between two different files of the exact same byte
-                # count would be misclassified as already-delivered. Downstream
-                # consumers already have the .mrk SHA256 sidecar for that case.
-                # See docs/decisions.md 2026-08-04.
-                try:
-                    existing_size = sftp.stat(final_remote_path).st_size
-                except OSError:
-                    raise rename_exc  # destination doesn't exist either - unrelated failure
-                if existing_size != local_size:
-                    raise DeliveryCollisionError(
-                        f"{final_remote_path} already exists with a different size "
-                        f"({existing_size} bytes) than this upload ({local_size} bytes)"
-                    ) from rename_exc
-                log.info(
-                    f"{final_remote_path} already exists with matching size "
-                    f"({local_size} bytes) - treating as already delivered, not "
-                    "re-uploading"
-                )
-                sftp.remove(temp_remote_path)
-        finally:
-            sftp.close()
-
-```
-
-tests/services/test_delivery_service.py:
-
-```python
-from datetime import datetime, timezone
-from pathlib import Path
-from types import SimpleNamespace
-
-import paramiko
-import pytest
-
-from app.core.config import settings
-from app.services.delivery_service import (
-    DeliveryAuthenticationError,
-    DeliveryCollisionError,
-    DeliveryConfigError,
-    DeliveryError,
-    DeliveryRemoteDirectoryNotFoundError,
-    DeliveryService,
-    DeliveryUnavailableError,
-)
-
-
-class FakeSFTPClient:
-    """In-memory stand-in for paramiko.SFTPClient - same shape as the calls
-    DeliveryService actually makes (put/stat/rename/remove/close)."""
-
-    def __init__(
-        self,
-        fail_puts_before_success: int = 0,
-        corrupt_upload_size: int | None = None,
-        preexisting_remote_files: dict[str, int] | None = None,
-        raise_missing_remote_directory: bool = False,
-    ):
-        self.remote_files: dict[str, int] = dict(preexisting_remote_files or {})
-        self._fail_puts_before_success = fail_puts_before_success
-        self._corrupt_upload_size = corrupt_upload_size
-        self._raise_missing_remote_directory = raise_missing_remote_directory
-        self.put_calls: list[str] = []
-        self.remove_calls: list[str] = []
-        self.closed = False
-
-    def put(self, localpath: str, remotepath: str, confirm: bool = True):
-        self.put_calls.append(remotepath)
-        if self._raise_missing_remote_directory:
-            raise OSError(2, "No such file or directory")
-        if self._fail_puts_before_success > 0:
-            self._fail_puts_before_success -= 1
-            raise OSError("connection reset during upload")
-        size = Path(localpath).stat().st_size
-        self.remote_files[remotepath] = (
-            self._corrupt_upload_size if self._corrupt_upload_size is not None else size
-        )
-
-    def stat(self, remotepath: str):
-        return SimpleNamespace(st_size=self.remote_files[remotepath])
-
-    def rename(self, oldpath: str, newpath: str):
-        # Real SFTP servers (confirmed live against atmoz/sftp) refuse to rename
-        # onto an existing destination - mirror that here instead of silently
-        # overwriting, so the idempotent-redelivery handling has something real
-        # to catch.
-        if newpath in self.remote_files:
-            raise OSError("Failure")
-        self.remote_files[newpath] = self.remote_files.pop(oldpath)
-
-    def remove(self, remotepath: str):
-        self.remove_calls.append(remotepath)
-        del self.remote_files[remotepath]
-
-    def close(self):
-        self.closed = True
-
-
-@pytest.fixture
-def local_file(tmp_path) -> Path:
-    path = tmp_path / "output.csv"
-    path.write_text("id,name\n1,Acme\n")
-    return path
-
-
-def test_successful_delivery_uploads_and_renames_to_final_path(local_file):
-    fake = FakeSFTPClient()
-    service = DeliveryService(client_factory=lambda: fake)
-
-    result = service.deliver(local_file, remote_directory="/outbound/reports")
-
-    assert result.remote_path == "/outbound/reports/output.csv"
-    assert result.size_bytes == local_file.stat().st_size
-    assert "/outbound/reports/output.csv" in fake.remote_files
-    assert "/outbound/reports/output.csv.part" not in fake.remote_files
-    assert fake.put_calls == ["/outbound/reports/output.csv.part"]
-
-
-def test_custom_remote_filename_is_honored(local_file):
-    fake = FakeSFTPClient()
-    service = DeliveryService(client_factory=lambda: fake)
-
-    result = service.deliver(
-        local_file,
-        remote_directory="/outbound/reports",
-        remote_filename="CANDER_20260723.csv",
-    )
-
-    assert result.remote_path == "/outbound/reports/CANDER_20260723.csv"
-
-
-def test_retries_then_succeeds_on_transient_failure(local_file):
-    fake = FakeSFTPClient(fail_puts_before_success=1)
-    factory_calls = []
-
-    def factory():
-        factory_calls.append(1)
-        return fake
-
-    service = DeliveryService(client_factory=factory)
-
-    result = service.deliver(local_file, remote_directory="/outbound/reports")
-
-    assert result.remote_path == "/outbound/reports/output.csv"
-    assert len(factory_calls) == 2
-
-
-def test_size_mismatch_after_upload_is_retried_then_raises(local_file):
-    fake = FakeSFTPClient(corrupt_upload_size=999999)
-    service = DeliveryService(client_factory=lambda: fake)
-
-    with pytest.raises(DeliveryError):
-        service.deliver(local_file, remote_directory="/outbound/reports")
-
-
-def test_successful_delivery_result_includes_delivered_at_timestamp(local_file):
-    fake = FakeSFTPClient()
-    service = DeliveryService(client_factory=lambda: fake)
-
-    before = datetime.now(timezone.utc)
-    result = service.deliver(local_file, remote_directory="/outbound/reports")
-    after = datetime.now(timezone.utc)
-
-    assert before <= result.delivered_at <= after
-
-
-def test_authentication_failure_raises_structured_error_and_is_not_retried(local_file):
-    calls = []
-
-    def factory():
-        calls.append(1)
-        raise paramiko.AuthenticationException("bad key")
-
-    service = DeliveryService(client_factory=factory)
-
-    with pytest.raises(DeliveryAuthenticationError) as exc_info:
-        service.deliver(local_file, remote_directory="/outbound/reports")
-
-    assert len(calls) == 1
-    assert isinstance(exc_info.value.__cause__, paramiko.AuthenticationException)
-
-
-def test_server_unavailable_after_retries_raises_structured_error(
-    local_file, monkeypatch
-):
-    monkeypatch.setattr(settings, "SFTP_RETRY_COUNT", 2)
-    calls = []
-
-    def factory():
-        calls.append(1)
-        raise OSError("Connection refused")
-
-    service = DeliveryService(client_factory=factory)
-
-    with pytest.raises(DeliveryUnavailableError) as exc_info:
-        service.deliver(local_file, remote_directory="/outbound/reports")
-
-    assert len(calls) == 2
-    assert isinstance(exc_info.value.__cause__, OSError)
-
-
-def test_bad_host_key_is_not_wrapped_as_unavailable(local_file):
-    """Host-key mismatch is a distinct, security-relevant concern from AC3/AC4 - kept as
-    the raw paramiko type rather than folded into DeliveryUnavailableError."""
-    calls = []
-
-    fake_key = SimpleNamespace(get_base64=lambda: "fakekeybase64")
-
-    def factory():
-        calls.append(1)
-        raise paramiko.BadHostKeyException("host", fake_key, fake_key)
-
-    service = DeliveryService(client_factory=factory)
-
-    with pytest.raises(paramiko.BadHostKeyException):
-        service.deliver(local_file, remote_directory="/outbound/reports")
-
-    assert len(calls) == 1
-
-
-def test_missing_local_file_raises_without_connecting(tmp_path):
-    calls = []
-
-    def factory():
-        calls.append(1)
-        return FakeSFTPClient()
-
-    service = DeliveryService(client_factory=factory)
-
-    with pytest.raises(FileNotFoundError):
-        service.deliver(
-            tmp_path / "does_not_exist.csv", remote_directory="/outbound/reports"
-        )
-
-    assert calls == []
-
-
-def test_missing_required_settings_raises_config_error(local_file, monkeypatch):
-    monkeypatch.setattr(settings, "SFTP_HOST", None)
-    service = DeliveryService()
-
-    with pytest.raises(DeliveryConfigError):
-        service.deliver(local_file, remote_directory="/outbound/reports")
-
-
-def test_redelivery_with_matching_size_at_destination_succeeds_idempotently(local_file):
-    local_size = local_file.stat().st_size
-    fake = FakeSFTPClient(
-        preexisting_remote_files={"/outbound/reports/output.csv": local_size}
-    )
-    service = DeliveryService(client_factory=lambda: fake)
-
-    result = service.deliver(local_file, remote_directory="/outbound/reports")
-
-    assert result.remote_path == "/outbound/reports/output.csv"
-    assert result.size_bytes == local_size
-    # temp .part file cleaned up via sftp.remove(), not left dangling
-    assert "/outbound/reports/output.csv.part" not in fake.remote_files
-    assert fake.remove_calls == ["/outbound/reports/output.csv.part"]
-
-
-def test_redelivery_with_different_size_at_destination_raises_collision_error_not_retried(
-    local_file,
-):
-    fake = FakeSFTPClient(
-        preexisting_remote_files={"/outbound/reports/output.csv": 999999}
-    )
-    service = DeliveryService(client_factory=lambda: fake)
-
-    with pytest.raises(DeliveryCollisionError):
-        service.deliver(local_file, remote_directory="/outbound/reports")
-
-    # not retried - exactly one put attempt, not settings.SFTP_RETRY_COUNT of them
-    assert fake.put_calls == ["/outbound/reports/output.csv.part"]
-
-
-def test_missing_known_hosts_file_raises_config_error(
-    local_file, monkeypatch, tmp_path
-):
-    key_path = tmp_path / "id_rsa"
-    key_path.write_text("fake key content")
-    monkeypatch.setattr(settings, "SFTP_HOST", "lvappi01908.cloud.bns")
-    monkeypatch.setattr(settings, "SFTP_USERNAME", "svc-account")
-    monkeypatch.setattr(settings, "SFTP_PRIVATE_KEY_PATH", str(key_path))
-    monkeypatch.setattr(settings, "SFTP_KNOWN_HOSTS_PATH", "does-not-exist-known-hosts")
-    service = DeliveryService()
-
-    with pytest.raises(DeliveryConfigError):
-        service.deliver(local_file, remote_directory="/outbound/reports")
-
-
-def test_missing_local_private_key_raises_config_error_and_is_not_retried(
-    local_file, monkeypatch, tmp_path
-):
-    known_hosts = tmp_path / "known_hosts"
-    known_hosts.write_text("")
-    monkeypatch.setattr(settings, "SFTP_HOST", "lvappi01908.cloud.bns")
-    monkeypatch.setattr(settings, "SFTP_USERNAME", "svc-account")
-    monkeypatch.setattr(
-        settings, "SFTP_PRIVATE_KEY_PATH", str(tmp_path / "does-not-exist")
-    )
-    monkeypatch.setattr(
-        type(settings), "known_hosts_path", property(lambda self: known_hosts)
-    )
-
-    def _unexpected_ssh_client():
-        raise AssertionError(
-            "should never reach paramiko.SSHClient() - the private key check "
-            "should have short-circuited first"
-        )
-
-    # No client_factory - exercises _connect()'s own body, same pattern as
-    # test_connect_uses_legacy_global_settings_when_no_connection_given. Guard
-    # against a real network attempt if the check fails to short-circuit.
-    monkeypatch.setattr("paramiko.SSHClient", _unexpected_ssh_client)
-    service = DeliveryService()
-
-    with pytest.raises(DeliveryConfigError, match="does-not-exist"):
-        service.deliver(local_file, remote_directory="/outbound/reports")
-
-
-def test_remote_directory_missing_raises_specific_error_and_is_not_retried(local_file):
-    fake = FakeSFTPClient(raise_missing_remote_directory=True)
-    service = DeliveryService(client_factory=lambda: fake)
-
-    with pytest.raises(DeliveryRemoteDirectoryNotFoundError, match="/outbound/reports"):
-        service.deliver(local_file, remote_directory="/outbound/reports")
-
-    # not retried - exactly one put attempt, not settings.SFTP_RETRY_COUNT of them
-    assert fake.put_calls == ["/outbound/reports/output.csv.part"]
-
-
-class _RecordingSSHClient:
-    """Stands in for paramiko.SSHClient itself (not the SFTP client returned by
-    open_sftp()) - used specifically to verify _connect()'s own connection-detail
-    resolution logic, which the client_factory seam above bypasses entirely."""
-
-    calls: list[dict] = []
-
-    def __init__(self):
-        self.loaded_host_keys = None
-        self.missing_host_key_policy = None
-
-    def load_host_keys(self, path):
-        self.loaded_host_keys = path
-
-    def set_missing_host_key_policy(self, policy):
-        self.missing_host_key_policy = policy
-
-    def connect(self, hostname, port, username, key_filename, timeout):
-        _RecordingSSHClient.calls.append(
-            {
-                "hostname": hostname,
-                "port": port,
-                "username": username,
-                "key_filename": key_filename,
-            }
-        )
-
-    def open_sftp(self):
-        return FakeSFTPClient()
-
-
-def test_connect_uses_legacy_global_settings_when_no_connection_given(
-    local_file, monkeypatch, tmp_path
-):
-    known_hosts = tmp_path / "known_hosts"
-    known_hosts.write_text("")
-    key_path = tmp_path / "legacy_key"
-    key_path.write_text("fake key content")
-    monkeypatch.setattr(settings, "SFTP_HOST", "legacy-host")
-    monkeypatch.setattr(settings, "SFTP_PORT", 22)
-    monkeypatch.setattr(settings, "SFTP_USERNAME", "legacy-user")
-    monkeypatch.setattr(settings, "SFTP_PRIVATE_KEY_PATH", str(key_path))
-    monkeypatch.setattr(
-        type(settings), "known_hosts_path", property(lambda self: known_hosts)
-    )
-    monkeypatch.setattr("paramiko.SSHClient", _RecordingSSHClient)
-    _RecordingSSHClient.calls = []
-
-    service = DeliveryService()
-    service.deliver(local_file, remote_directory="/outbound/reports")
-
-    assert _RecordingSSHClient.calls == [
-        {
-            "hostname": "legacy-host",
-            "port": 22,
-            "username": "legacy-user",
-            "key_filename": str(key_path),
-        }
-    ]
-
-
-def test_connect_uses_passed_connection_details_when_given(
-    local_file, monkeypatch, tmp_path
-):
-    from app.services.sftp_connection_service import SFTPConnectionSettings
-
-    known_hosts = tmp_path / "known_hosts"
-    known_hosts.write_text("")
-    key_path = tmp_path / "id_ed25519"
-    key_path.write_text("fake key content")
-    monkeypatch.setattr("paramiko.SSHClient", _RecordingSSHClient)
-    _RecordingSSHClient.calls = []
-
-    connection = SFTPConnectionSettings(
-        host="lvappi01908.cloud.bns",
-        port=2222,
-        username="sftpuser",
-        private_key_path=str(key_path),
-        known_hosts_path=known_hosts,
-        remote_folder="./ClientCentralDataFenergo",
-    )
-    service = DeliveryService()
-    service.deliver(
-        local_file, remote_directory="/outbound/reports", connection=connection
-    )
-
-    assert _RecordingSSHClient.calls == [
-        {
-            "hostname": "lvappi01908.cloud.bns",
-            "port": 2222,
-            "username": "sftpuser",
-            "key_filename": str(key_path),
-        }
-    ]
-
-```
-
-dag
+## dag
 
 ```python
 from datetime import datetime
@@ -721,4 +34,1627 @@ def run_report_full():
 
 
 run_report_full()
+```
+
+## Jira
+
+Title: Register finalized GTT reports (Product, UK Product) and rename China/CANDER assets
+
+Description:
+As the platform, I need the five finalized GTT onboarding-status reports registered so they can be run via run-report.
+
+Renamed China_GTT_Report → China_OnboardingStatus_YYYYMMDD and CANDER_Report_ExtractTemplate → CanadianDerivatives_OnboardingStatus_YYYYMMDD (SQL + template assets), keeping existing ChinaGTTReport/CANDERReport CLI names unchanged.
+Registered two new reports: ProductReport (GTT/Product) and UKProductReport (GTT/UKProduct), with real column templates for UK Product (Product's headers not yet available).
+Added real column templates (Source=Target) for China and Canadian Derivatives from their actual Fenergo CSV exports.
+Standardized output/marker filenames to date-only (YYYYMMDD), replacing the previous timestamp format, across all reports.
+
+## Changes
+
+app/services/reporting_orchestrator.py:
+
+```python
+#
+    @staticmethod
+    def _timestamp() -> str:
+        """Date-only (YYYYMMDD), matching the finalized reports' naming standard"""
+        return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+```
+
+app/services/report_definition_service.py:
+
+```python
+from app.core.config import settings
+from app.services.fenergo_service import ReportSource
+from report_definitions import (
+    cander_report,
+    china_gtt_report,
+    product_report,
+    singapore_report,
+    uk_product_report,
+)
+# ...
+
+        for module in (
+            cander_report,
+            china_gtt_report,
+            product_report,
+            singapore_report,
+            uk_product_report,
+        )
+```
+
+new report_definitions/cander_report.py:
+
+```python
+REPORT_NAME = "CANDERReport"
+SQL_FILE = "CanadianDerivatives_OnboardingStatus_YYYYMMDD.sql"
+TEMPLATE_FILE = "CanadianDerivatives_OnboardingStatus.xml"
+ARCHIVE_PATH = "GTT/Cander"
+SFTP_CONNECTION = "ClientCentralData"
+
+```
+
+report_definitions/china_gtt_report.py:
+
+```python
+REPORT_NAME = "ChinaGTTReport"
+# Renamed 2026-09-01 to match the finalized report name saved on the Fenergo platform
+# itself - "YYYYMMDD" is literal text in the filename, not a real date (see
+# docs/decisions.md). Starts empty - real SQL not yet provided.
+SQL_FILE = "China_OnboardingStatus_YYYYMMDD.sql"
+TEMPLATE_FILE = "China_OnboardingStatus.xml"
+ARCHIVE_PATH = "GTT/China"
+SFTP_CONNECTION = "RegCentral"
+
+```
+
+report_definitions/product_report.py:
+
+```python
+REPORT_NAME = "ProductReport"
+# "YYYYMMDD" is literal text in the filename, matching the report name saved on the
+# Fenergo platform itself (see docs/decisions.md). Empty - real SQL not yet provided.
+SQL_FILE = "Product_OnboardingStatus_YYYYMMDD.sql"
+# Template has zero columns - real CSV column headers for this report don't exist yet
+# (see docs/decisions.md 2026-09-01).
+TEMPLATE_FILE = "Product_OnboardingStatus.xml"
+ARCHIVE_PATH = "GTT/Product"
+# Assumed - only one real connection exists as of 2026-08-24 (docs/decisions.md).
+# Confirm/correct once this report has real executable SQL.
+SFTP_CONNECTION = "ClientCentralData"
+
+```
+
+report_definitions/uk_product_report.py:
+
+```python
+REPORT_NAME = "UKProductReport"
+# "YYYYMMDD" is literal text in the filename, matching the report name saved on the
+# Fenergo platform itself (see docs/decisions.md). Empty - real SQL not yet provided.
+SQL_FILE = "UK_Product_OnboardingStatus_YYYYMMDD.sql"
+TEMPLATE_FILE = "UK_Product_OnboardingStatus.xml"
+ARCHIVE_PATH = "GTT/UKProduct"
+# Assumed - only one real connection exists as of 2026-08-24 (docs/decisions.md).
+# Confirm/correct once this report has real executable SQL.
+SFTP_CONNECTION = "ClientCentralData"
+
+```
+
+tests/services/test_report_definition_service.py:
+
+```python
+import pytest
+
+from app.core.config import Settings, settings
+from app.services.fenergo_service import ReportSource
+from app.services.report_definition_service import (
+    ReportDefinition,
+    ReportDefinitionService,
+)
+
+
+def test_get_returns_known_report_definition():
+    definition = ReportDefinitionService.get("CANDERReport")
+    assert definition == ReportDefinition(
+        sql_file="CanadianDerivatives_OnboardingStatus_YYYYMMDD.sql",
+        template_file="CanadianDerivatives_OnboardingStatus.xml",
+        archive_path="GTT/Cander",
+        sftp_connection="ClientCentralData",
+    )
+    assert definition.generate_marker is True
+
+
+def test_generate_marker_defaults_to_true_when_omitted():
+    definition = ReportDefinition(
+        template_file="x.xml", sql_file="x.sql", archive_path="Test/Path"
+    )
+    assert definition.generate_marker is True
+
+
+def test_generate_marker_can_be_explicitly_disabled():
+    definition = ReportDefinition(
+        template_file="x.xml",
+        sql_file="x.sql",
+        archive_path="Test/Path",
+        generate_marker=False,
+    )
+    assert definition.generate_marker is False
+
+
+def test_get_raises_for_unknown_report_name():
+    with pytest.raises(KeyError):
+        ReportDefinitionService.get("DoesNotExist")
+
+
+def test_get_returns_china_gtt_report_definition():
+    definition = ReportDefinitionService.get("ChinaGTTReport")
+    assert definition == ReportDefinition(
+        sql_file="China_OnboardingStatus_YYYYMMDD.sql",
+        template_file="China_OnboardingStatus.xml",
+        archive_path="GTT/China",
+        sftp_connection="RegCentral",
+    )
+
+
+def test_get_returns_product_report_definition():
+    definition = ReportDefinitionService.get("ProductReport")
+    assert definition == ReportDefinition(
+        sql_file="Product_OnboardingStatus_YYYYMMDD.sql",
+        template_file="Product_OnboardingStatus.xml",
+        archive_path="GTT/Product",
+        sftp_connection="ClientCentralData",
+    )
+
+
+def test_get_returns_uk_product_report_definition():
+    definition = ReportDefinitionService.get("UKProductReport")
+    assert definition == ReportDefinition(
+        sql_file="UK_Product_OnboardingStatus_YYYYMMDD.sql",
+        template_file="UK_Product_OnboardingStatus.xml",
+        archive_path="GTT/UKProduct",
+        sftp_connection="ClientCentralData",
+    )
+
+
+def test_archive_path_is_required():
+    with pytest.raises(TypeError):
+        ReportDefinition(template_file="x.xml", sql_file="x.sql")
+
+
+def test_sftp_connection_defaults_to_none_when_omitted():
+    definition = ReportDefinition(
+        template_file="x.xml", sql_file="x.sql", archive_path="Test/Path"
+    )
+    assert definition.sftp_connection is None
+
+
+def test_sql_and_template_file_paths_resolve_under_settings_paths():
+    sql_path = ReportDefinitionService.sql_file_path("CANDERReport")
+    template_path = ReportDefinitionService.template_file_path("CANDERReport")
+
+    assert sql_path.name == "CanadianDerivatives_OnboardingStatus_YYYYMMDD.sql"
+    assert sql_path.parent == settings.sql_query_path
+    assert template_path.name == "CanadianDerivatives_OnboardingStatus.xml"
+    assert template_path.parent == settings.template_path
+
+
+def test_extract_templates_removed_from_settings():
+    """Hard rule (CLAUDE.md #5): the registry belongs in report_definitions/ files,
+    not hardcoded inside Settings. Settings is for env/secrets only."""
+    assert "EXTRACT_TEMPLATES" not in Settings.model_fields
+
+
+def test_report_definition_rejects_both_sql_file_and_saved_query_id():
+    with pytest.raises(ValueError):
+        ReportDefinition(
+            template_file="x.xml",
+            sql_file="x.sql",
+            saved_query_id="abc-123",
+            archive_path="Test/Path",
+        )
+
+
+def test_report_definition_rejects_neither_sql_file_nor_saved_query_id():
+    with pytest.raises(ValueError):
+        ReportDefinition(template_file="x.xml", archive_path="Test/Path")
+
+
+def test_report_source_reads_sql_file_text_for_sql_file_based_report():
+    source = ReportDefinitionService.report_source("ChinaGTTReport")
+
+    assert source == ReportSource(
+        sql_query=ReportDefinitionService.sql_file_path("ChinaGTTReport").read_text()
+    )
+
+
+def test_report_source_wraps_saved_query_id_for_saved_query_based_report(monkeypatch):
+    saved_query_definition = ReportDefinition(
+        template_file="China_GTT_Report_ExtractTemplate.xml",
+        saved_query_id="saved-query-abc-123",
+        archive_path="GTT/China",
+    )
+    monkeypatch.setitem(
+        ReportDefinitionService._registry,
+        "SavedQueryTestReport",
+        saved_query_definition,
+    )
+
+    source = ReportDefinitionService.report_source("SavedQueryTestReport")
+
+    assert source == ReportSource(saved_query_id="saved-query-abc-123")
+
+
+def test_sql_file_path_raises_clearly_for_saved_query_based_report(monkeypatch):
+    saved_query_definition = ReportDefinition(
+        template_file="China_GTT_Report_ExtractTemplate.xml",
+        saved_query_id="saved-query-abc-123",
+        archive_path="GTT/China",
+    )
+    monkeypatch.setitem(
+        ReportDefinitionService._registry,
+        "SavedQueryTestReport",
+        saved_query_definition,
+    )
+
+    with pytest.raises(ValueError):
+        ReportDefinitionService.sql_file_path("SavedQueryTestReport")
+
+```
+
+
+tests/services/test_reporting_orchestrator.py:
+
+```python
+import dataclasses
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from app.core.config import settings
+from app.models.execution import ExecutionStatus
+from app.services import execution_service
+from app.services.delivery_service import (
+    DeliveryConfigError,
+    DeliveryError,
+    DeliveryResult,
+)
+from app.services.download_service import DownloadResult
+from app.services.fenergo_service import StatusResult, SubmitResult
+from app.services.report_definition_service import ReportDefinitionService
+from app.services.reporting_orchestrator import (
+    OrchestrationError,
+    ReportingOrchestrator,
+    UtilityOperationResult,
+)
+
+CHINA_GTT_CSV = (
+    "Fenergo ID,Client Name,LEI,Global Risk Rating,Scheduled Review Date,"
+    "China Risk Rating,China Risk Rating (Override),China Next Review Date,"
+    "China Next Review Date (Override),China Comments,Country of Incorporation,"
+    "Product Category,Product Type,Booking Entity,Arranging Entity,Product ID\n"
+    "1,Acme Corp,LEI123,High,2026-01-01,Medium,,2026-06-01,,,China,FamilyA,"
+    "TypeA,EntityA,EntityB,PROD-1\n"
+)
+
+
+class FakeFenergoService:
+    def __init__(
+        self, status="Completed", presigned_url="https://example.test/report.csv"
+    ):
+        self.status = status
+        self.presigned_url = presigned_url
+        self.submit_calls = []
+
+    async def submit(self, source, description):
+        self.submit_calls.append((source, description))
+        return SubmitResult(report_id="FEN-123")
+
+    async def check_status(self, report_id):
+        return StatusResult(status=self.status, presigned_url=self.presigned_url)
+
+
+class FakeDownloadService:
+    def __init__(self, csv_content=CHINA_GTT_CSV):
+        self._csv_content = csv_content
+        self.download_calls = []
+
+    async def download(self, presigned_url, destination_filename):
+        self.download_calls.append((presigned_url, destination_filename))
+        path = settings.download_path / destination_filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self._csv_content)
+        return DownloadResult(local_path=path, size_bytes=len(self._csv_content))
+
+
+class FailingDownloadService:
+    async def download(self, presigned_url, destination_filename):
+        raise RuntimeError("simulated download failure")
+
+
+class FakeDeliveryService:
+    def __init__(self, fail: bool = False):
+        self.deliver_calls = []
+        self._fail = fail
+
+    def deliver(
+        self, local_path, remote_directory, remote_filename=None, connection=None
+    ):
+        self.deliver_calls.append((local_path, remote_directory, connection))
+        if self._fail:
+            raise DeliveryError("simulated delivery failure")
+        return DeliveryResult(
+            remote_path=f"{remote_directory}/{local_path.name}",
+            size_bytes=local_path.stat().st_size,
+            delivered_at=datetime.now(timezone.utc),
+        )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_download_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "DOWNLOAD_FOLDER", str(tmp_path / "downloads"))
+    monkeypatch.setattr(settings, "SFTP_SUCCESS_DIRECTORY", "success")
+    monkeypatch.setattr(settings, "AUDIT_ROOT", None)
+    # ChinaGTTReport declares sftp_connection="RegCentral" - required env vars for
+    # SFTPConnectionService.get() to resolve without raising.
+    monkeypatch.setenv("SFTP_REGCENTRAL_HOST", "test-host")
+    monkeypatch.setenv("SFTP_REGCENTRAL_USERNAME", "test-user")
+    monkeypatch.setenv("SFTP_REGCENTRAL_PRIVATE_KEY_PATH", "/test/key")
+    monkeypatch.setenv("SFTP_REGCENTRAL_REMOTE_FOLDER", "./RegCentralTest")
+
+
+def _seed_full_run_execution(report_name="ChinaGTTReport", downloaded_file_path=None):
+    """Seeds a real FULL_RUN execution the way submit->download would leave it -
+    the shape every linked utility-flow test needs to attach to."""
+    execution = execution_service.create_execution(report_name)
+    execution_service.mark_submitted(execution.execution_id, "FEN-123")
+    if downloaded_file_path is not None:
+        execution_service.mark_downloaded(
+            execution.execution_id, str(downloaded_file_path)
+        )
+    return execution
+
+
+async def test_run_report_full_success_sequences_all_steps_and_completes(db):
+    fenergo = FakeFenergoService()
+    download = FakeDownloadService()
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=fenergo, download_service=download, delivery_service=delivery
+    )
+
+    execution = await orchestrator.run_report("ChinaGTTReport")
+
+    assert execution.status == ExecutionStatus.SFTP_COMPLETED.value
+    assert execution.fenergo_report_id == "FEN-123"
+    assert execution.output_file_path is not None
+
+    output_path = Path(execution.output_file_path)
+    assert output_path.exists()
+    content = output_path.read_text()
+    assert "Fenergo ID" in content
+    assert "TypeA" in content
+
+    marker_path = output_path.with_suffix(output_path.suffix + ".mrk")
+    assert marker_path.exists()
+
+    assert (
+        marker_path.read_text().strip()
+        == hashlib.sha256(output_path.read_bytes()).hexdigest()
+    )
+
+    assert len(delivery.deliver_calls) == 2
+    delivered_paths = {call[0] for call in delivery.deliver_calls}
+    assert delivered_paths == {output_path, marker_path}
+    # ChinaGTTReport declares sftp_connection="RegCentral" - delivery goes to
+    # that connection's own remote_folder, not the legacy global SFTP_SUCCESS_DIRECTORY.
+    assert all(call[1] == "./RegCentralTest" for call in delivery.deliver_calls)
+    assert all(
+        call[2] is not None and call[2].host == "test-host"
+        for call in delivery.deliver_calls
+    )
+
+
+async def test_run_report_output_lands_under_reports_archive_path_locally(db):
+    """No AUDIT_ROOT set: settings.download_path/<archive_path>/, no Archive/Failed
+    split - matches the user's own description of local behavior."""
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=FakeDeliveryService(),
+    )
+
+    execution = await orchestrator.run_report("ChinaGTTReport")
+
+    output_path = Path(execution.output_file_path)
+    assert output_path.parent == settings.download_path / "GTT" / "China"
+
+
+async def test_run_report_output_lands_under_audit_root_archive_when_set(
+    db, monkeypatch, tmp_path
+):
+    audit_root = tmp_path / "Audit"
+    monkeypatch.setattr(settings, "AUDIT_ROOT", str(audit_root))
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=FakeDeliveryService(),
+    )
+
+    execution = await orchestrator.run_report("ChinaGTTReport")
+
+    output_path = Path(execution.output_file_path)
+    assert output_path.parent == audit_root / "Archive" / "GTT" / "China"
+
+
+async def test_run_report_moves_output_to_failed_when_delivery_fails_and_audit_root_set(
+    db, monkeypatch, tmp_path
+):
+    audit_root = tmp_path / "Audit"
+    monkeypatch.setattr(settings, "AUDIT_ROOT", str(audit_root))
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=FakeDeliveryService(fail=True),
+    )
+
+    with pytest.raises(DeliveryError):
+        await orchestrator.run_report("ChinaGTTReport")
+
+    archive_dir = audit_root / "Archive" / "GTT" / "China"
+    failed_dir = audit_root / "Failed" / "GTT" / "China"
+    assert list(archive_dir.glob("*.csv")) == []
+    failed_files = list(failed_dir.glob("*.csv"))
+    assert len(failed_files) == 1
+    assert "Fenergo ID" in failed_files[0].read_text()
+
+
+async def test_run_report_leaves_output_in_place_when_delivery_fails_and_no_audit_root(
+    db,
+):
+    """Locally (no AUDIT_ROOT), Archive/Failed are the same directory - moving is a
+    harmless no-op, not an error."""
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=FakeDeliveryService(fail=True),
+    )
+
+    with pytest.raises(DeliveryError):
+        await orchestrator.run_report("ChinaGTTReport")
+
+    output_dir = settings.download_path / "GTT" / "China"
+    files = list(output_dir.glob("*.csv"))
+    assert len(files) == 1
+    assert "Fenergo ID" in files[0].read_text()
+
+
+async def test_run_report_full_success_records_seven_file_processing_rows_one_per_artifact(
+    db,
+):
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=FakeDeliveryService(),
+    )
+
+    execution = await orchestrator.run_report("ChinaGTTReport")
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    steps = [r.processing_step for r in records]
+    assert steps == [
+        "SUBMIT",
+        "POLL",
+        "DOWNLOAD",
+        "TRANSFORM",
+        "MARKER",
+        "DELIVER",
+        "DELIVER",
+    ]
+    assert all(r.status == "COMPLETED" for r in records)
+
+    marker_record = records[4]
+    output_path = Path(execution.output_file_path)
+    marker_path = output_path.with_suffix(output_path.suffix + ".mrk")
+    assert marker_record.checksum_value == marker_path.read_text().strip()
+
+    deliver_file_names = {
+        r.file_name for r in records if r.processing_step == "DELIVER"
+    }
+    assert deliver_file_names == {output_path.name, marker_path.name}
+
+
+async def test_run_report_skips_marker_records_five_file_processing_rows(
+    db, monkeypatch
+):
+    definition = ReportDefinitionService.get("ChinaGTTReport")
+    monkeypatch.setitem(
+        ReportDefinitionService._registry,
+        "ChinaGTTReport",
+        dataclasses.replace(definition, generate_marker=False),
+    )
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=FakeDeliveryService(),
+    )
+
+    execution = await orchestrator.run_report("ChinaGTTReport")
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert [r.processing_step for r in records] == [
+        "SUBMIT",
+        "POLL",
+        "DOWNLOAD",
+        "TRANSFORM",
+        "DELIVER",
+    ]
+    assert all(r.status == "COMPLETED" for r in records)
+
+
+async def test_run_report_marks_failed_when_polling_reports_failed(db):
+    fenergo = FakeFenergoService(status="Failed")
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=fenergo,
+        download_service=FakeDownloadService(),
+        delivery_service=FakeDeliveryService(),
+    )
+
+    with pytest.raises(OrchestrationError):
+        await orchestrator.run_report("ChinaGTTReport")
+
+    executions = [e for e in _all_executions() if e.report_name == "ChinaGTTReport"]
+    execution = executions[-1]
+    assert execution.status == ExecutionStatus.FAILED.value
+    assert execution.failure_stage == "POLL"
+
+
+async def test_run_report_marks_failed_when_download_raises(db):
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FailingDownloadService(),
+        delivery_service=FakeDeliveryService(),
+    )
+
+    with pytest.raises(RuntimeError):
+        await orchestrator.run_report("ChinaGTTReport")
+
+    execution = _all_executions()[-1]
+    assert execution.status == ExecutionStatus.FAILED.value
+    assert execution.failure_stage == "DOWNLOAD"
+    assert "simulated download failure" in execution.error_message
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert [r.processing_step for r in records] == ["SUBMIT", "POLL", "DOWNLOAD"]
+    assert records[-1].status == "FAILED"
+
+
+async def test_run_report_marks_failed_when_marker_generation_raises(db):
+    class FailingMarkerService:
+        @staticmethod
+        def create_marker_for_file(path):
+            raise OSError("simulated marker generation failure")
+
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=delivery,
+        marker_service=FailingMarkerService,
+    )
+
+    with pytest.raises(OSError):
+        await orchestrator.run_report("ChinaGTTReport")
+
+    assert delivery.deliver_calls == []
+    execution = _all_executions()[-1]
+    assert execution.status == ExecutionStatus.FAILED.value
+    assert execution.failure_stage == "MARKER"
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert [r.processing_step for r in records] == [
+        "SUBMIT",
+        "POLL",
+        "DOWNLOAD",
+        "TRANSFORM",
+        "MARKER",
+    ]
+    assert records[-1].status == "FAILED"
+    assert "simulated marker generation failure" in records[-1].error_message
+
+
+async def test_run_report_raises_delivery_config_error_when_success_directory_unset(
+    db, monkeypatch
+):
+    # ChinaGTTReport now delivers via sftp_connection="RegCentral" (see
+    # SFTPConnectionService), not the legacy global SFTP_SUCCESS_DIRECTORY - the
+    # connection's own required env var is what needs to be missing to reproduce
+    # this config error for this report now.
+    monkeypatch.delenv("SFTP_REGCENTRAL_HOST", raising=False)
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=delivery,
+    )
+
+    with pytest.raises(DeliveryConfigError):
+        await orchestrator.run_report("ChinaGTTReport")
+
+    assert delivery.deliver_calls == []
+    execution = _all_executions()[-1]
+    assert execution.status == ExecutionStatus.FAILED.value
+    assert execution.failure_stage == "DELIVER"
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert [r.processing_step for r in records] == [
+        "SUBMIT",
+        "POLL",
+        "DOWNLOAD",
+        "TRANSFORM",
+        "MARKER",
+        "DELIVER",
+    ]
+    assert [r.status for r in records] == [
+        "COMPLETED",
+        "COMPLETED",
+        "COMPLETED",
+        "COMPLETED",
+        "COMPLETED",
+        "FAILED",
+    ]
+
+
+async def test_run_report_explicit_true_override_forces_marker_over_false_default(
+    db, monkeypatch
+):
+    definition = ReportDefinitionService.get("ChinaGTTReport")
+    monkeypatch.setitem(
+        ReportDefinitionService._registry,
+        "ChinaGTTReport",
+        dataclasses.replace(definition, generate_marker=False),
+    )
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=delivery,
+    )
+
+    execution = await orchestrator.run_report("ChinaGTTReport", generate_marker=True)
+
+    output_path = Path(execution.output_file_path)
+    marker_path = output_path.with_suffix(output_path.suffix + ".mrk")
+    assert marker_path.exists()
+    assert len(delivery.deliver_calls) == 2
+
+
+async def test_run_report_explicit_false_override_suppresses_marker_over_true_default(
+    db,
+):
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=delivery,
+    )
+
+    execution = await orchestrator.run_report("ChinaGTTReport", generate_marker=False)
+
+    output_path = Path(execution.output_file_path)
+    marker_path = output_path.with_suffix(output_path.suffix + ".mrk")
+    assert not marker_path.exists()
+    assert len(delivery.deliver_calls) == 1
+
+
+async def test_run_report_no_sftp_no_output_path_skips_delivery_stays_transformed(db):
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=delivery,
+    )
+
+    execution = await orchestrator.run_report("ChinaGTTReport", sftp=False)
+
+    assert execution.status == ExecutionStatus.TRANSFORMED.value
+    assert delivery.deliver_calls == []
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert [r.processing_step for r in records] == [
+        "SUBMIT",
+        "POLL",
+        "DOWNLOAD",
+        "TRANSFORM",
+        "MARKER",
+    ]
+
+
+async def test_run_report_output_path_copies_locally_and_completes(db, tmp_path):
+    destination = tmp_path / "local_drop"
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=FakeDeliveryService(),
+    )
+
+    execution = await orchestrator.run_report(
+        "ChinaGTTReport", local_destination=destination
+    )
+
+    assert execution.status == ExecutionStatus.SFTP_COMPLETED.value
+    output_path = Path(execution.output_file_path)
+    marker_path = output_path.with_suffix(output_path.suffix + ".mrk")
+    assert (destination / output_path.name).exists()
+    assert (destination / marker_path.name).exists()
+    assert (destination / output_path.name).read_bytes() == output_path.read_bytes()
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    deliver_records = [r for r in records if r.processing_step == "DELIVER"]
+    assert len(deliver_records) == 2
+    assert {r.output_file_path for r in deliver_records} == {
+        str(destination / output_path.name),
+        str(destination / marker_path.name),
+    }
+
+
+async def test_run_report_sftp_true_and_output_path_together_raises(db, tmp_path):
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=FakeDeliveryService(),
+    )
+
+    with pytest.raises(ValueError):
+        await orchestrator.run_report(
+            "ChinaGTTReport", sftp=True, local_destination=tmp_path / "out"
+        )
+
+
+async def test_submit_report_success_creates_and_marks_submitted(db):
+    orchestrator = ReportingOrchestrator(fenergo_service=FakeFenergoService())
+
+    execution = await orchestrator.submit_report("ChinaGTTReport")
+
+    assert execution.status == ExecutionStatus.REQUEST_SUBMITTED.value
+    assert execution.report_name == "ChinaGTTReport"
+    assert execution.fenergo_report_id == "FEN-123"
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert len(records) == 1
+    assert records[0].processing_step == "SUBMIT"
+    assert records[0].status == "COMPLETED"
+
+
+async def test_submit_report_marks_failed_when_fenergo_raises(db):
+    class FailingFenergoService:
+        async def submit(self, source, description):
+            raise RuntimeError("simulated submit failure")
+
+    orchestrator = ReportingOrchestrator(fenergo_service=FailingFenergoService())
+
+    with pytest.raises(RuntimeError):
+        await orchestrator.submit_report("ChinaGTTReport")
+
+    execution = _all_executions()[-1]
+    assert execution.status == ExecutionStatus.FAILED.value
+    assert execution.failure_stage == "SUBMIT"
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert len(records) == 1
+    assert records[0].processing_step == "SUBMIT"
+    assert records[0].status == "FAILED"
+
+
+async def test_poll_execution_success_returns_presigned_url_and_marks_url_received(db):
+    created = execution_service.create_execution("ChinaGTTReport")
+    execution_service.mark_submitted(created.execution_id, "FEN-123")
+    orchestrator = ReportingOrchestrator(fenergo_service=FakeFenergoService())
+
+    poll_result = await orchestrator.poll_execution(created.execution_id)
+
+    assert poll_result.status == "Completed"
+    assert poll_result.presigned_url == "https://example.test/report.csv"
+    updated = execution_service.get_execution(created.execution_id)
+    assert updated.status == ExecutionStatus.REPORT_READY.value
+
+    records = execution_service.list_file_processing(created.execution_id)
+    assert len(records) == 1
+    assert records[0].processing_step == "POLL"
+    assert records[0].status == "COMPLETED"
+
+
+async def test_poll_execution_marks_failed_when_status_is_failed(db):
+    created = execution_service.create_execution("ChinaGTTReport")
+    execution_service.mark_submitted(created.execution_id, "FEN-123")
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(status="Failed")
+    )
+
+    with pytest.raises(OrchestrationError):
+        await orchestrator.poll_execution(created.execution_id)
+
+    updated = execution_service.get_execution(created.execution_id)
+    assert updated.status == ExecutionStatus.FAILED.value
+    assert updated.failure_stage == "POLL"
+
+    records = execution_service.list_file_processing(created.execution_id)
+    assert len(records) == 1
+    assert records[0].processing_step == "POLL"
+    assert records[0].status == "FAILED"
+
+
+async def test_poll_execution_raises_lookuperror_directly_for_unknown_execution_id(db):
+    orchestrator = ReportingOrchestrator(fenergo_service=FakeFenergoService())
+
+    with pytest.raises(LookupError):
+        await orchestrator.poll_execution("does-not-exist")
+
+
+async def test_poll_execution_once_true_completes_immediately_without_looping(db):
+    created = execution_service.create_execution("ChinaGTTReport")
+    execution_service.mark_submitted(created.execution_id, "FEN-123")
+    orchestrator = ReportingOrchestrator(fenergo_service=FakeFenergoService())
+
+    poll_result = await orchestrator.poll_execution(created.execution_id, once=True)
+
+    assert poll_result.status == "Completed"
+    assert poll_result.presigned_url == "https://example.test/report.csv"
+    updated = execution_service.get_execution(created.execution_id)
+    assert updated.status == ExecutionStatus.REPORT_READY.value
+    assert updated.poll_attempts == 1
+
+    records = execution_service.list_file_processing(created.execution_id)
+    assert len(records) == 1
+    assert records[0].processing_step == "POLL"
+
+
+async def test_poll_execution_once_true_marks_failed_when_status_is_failed(db):
+    created = execution_service.create_execution("ChinaGTTReport")
+    execution_service.mark_submitted(created.execution_id, "FEN-123")
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(status="Failed")
+    )
+
+    with pytest.raises(OrchestrationError):
+        await orchestrator.poll_execution(created.execution_id, once=True)
+
+    updated = execution_service.get_execution(created.execution_id)
+    assert updated.status == ExecutionStatus.FAILED.value
+    assert updated.failure_stage == "POLL"
+
+    records = execution_service.list_file_processing(created.execution_id)
+    assert len(records) == 1
+    assert records[0].status == "FAILED"
+
+
+async def test_poll_execution_once_true_returns_pending_without_raising_or_marking_failed(
+    db,
+):
+    created = execution_service.create_execution("ChinaGTTReport")
+    execution_service.mark_submitted(created.execution_id, "FEN-123")
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(status="Pending")
+    )
+
+    poll_result = await orchestrator.poll_execution(created.execution_id, once=True)
+
+    assert poll_result.status == "Pending"
+    updated = execution_service.get_execution(created.execution_id)
+    # increment_poll_attempt() sets status=POLLING as a side effect - correct,
+    # not FAILED, which is the actual thing being asserted here.
+    assert updated.status == ExecutionStatus.POLLING.value
+    assert updated.failure_stage is None
+    assert updated.poll_attempts == 1
+
+    # "still pending" writes no file_processing row at all - not an event worth
+    # recording, same treatment as "not a failure".
+    assert execution_service.list_file_processing(created.execution_id) == []
+
+
+async def test_poll_execution_once_true_increments_poll_attempts_across_calls(db):
+    created = execution_service.create_execution("ChinaGTTReport")
+    execution_service.mark_submitted(created.execution_id, "FEN-123")
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(status="Pending")
+    )
+
+    await orchestrator.poll_execution(created.execution_id, once=True)
+    await orchestrator.poll_execution(created.execution_id, once=True)
+
+    updated = execution_service.get_execution(created.execution_id)
+    assert updated.poll_attempts == 2
+
+
+async def test_poll_execution_marks_failed_when_no_fenergo_report_id(db):
+    created = execution_service.create_execution("ChinaGTTReport")
+    orchestrator = ReportingOrchestrator(fenergo_service=FakeFenergoService())
+
+    with pytest.raises(ValueError):
+        await orchestrator.poll_execution(created.execution_id)
+
+    updated = execution_service.get_execution(created.execution_id)
+    assert updated.status == ExecutionStatus.FAILED.value
+    assert updated.failure_stage == "POLL"
+
+
+def test_poll_execution_no_fenergo_report_id_does_not_record_file_processing(db):
+    import asyncio
+
+    created = execution_service.create_execution("ChinaGTTReport")
+    orchestrator = ReportingOrchestrator(fenergo_service=FakeFenergoService())
+
+    with pytest.raises(ValueError):
+        asyncio.run(orchestrator.poll_execution(created.execution_id))
+
+    assert execution_service.list_file_processing(created.execution_id) == []
+
+
+async def test_download_execution_success(db):
+    created = execution_service.create_execution("ChinaGTTReport")
+    execution_service.mark_submitted(created.execution_id, "FEN-123")
+    download = FakeDownloadService()
+    orchestrator = ReportingOrchestrator(download_service=download)
+
+    execution = await orchestrator.download_execution(
+        created.execution_id, "https://example.test/report.csv"
+    )
+
+    assert execution.status == ExecutionStatus.DOWNLOADED.value
+    assert execution.downloaded_file_path is not None
+    assert download.download_calls == [
+        ("https://example.test/report.csv", "FEN-123.csv")
+    ]
+
+    records = execution_service.list_file_processing(created.execution_id)
+    assert len(records) == 1
+    assert records[0].processing_step == "DOWNLOAD"
+    assert records[0].status == "COMPLETED"
+
+
+async def test_download_execution_marks_failed_when_download_raises(db):
+    created = execution_service.create_execution("ChinaGTTReport")
+    execution_service.mark_submitted(created.execution_id, "FEN-123")
+    orchestrator = ReportingOrchestrator(download_service=FailingDownloadService())
+
+    with pytest.raises(RuntimeError):
+        await orchestrator.download_execution(created.execution_id, "https://x/y.csv")
+
+    updated = execution_service.get_execution(created.execution_id)
+    assert updated.status == ExecutionStatus.FAILED.value
+    assert updated.failure_stage == "DOWNLOAD"
+
+    records = execution_service.list_file_processing(created.execution_id)
+    assert len(records) == 1
+    assert records[0].status == "FAILED"
+
+
+async def test_download_execution_no_fenergo_report_id_does_not_record_file_processing(
+    db,
+):
+    created = execution_service.create_execution("ChinaGTTReport")
+    orchestrator = ReportingOrchestrator(download_service=FakeDownloadService())
+
+    with pytest.raises(ValueError):
+        await orchestrator.download_execution(created.execution_id, "https://x/y.csv")
+
+    assert execution_service.list_file_processing(created.execution_id) == []
+
+
+async def test_transform_execution_success(db, tmp_path):
+    input_path = tmp_path / "existing.csv"
+    input_path.write_text(CHINA_GTT_CSV)
+    created = execution_service.create_execution("ChinaGTTReport")
+    execution_service.mark_downloaded(created.execution_id, str(input_path))
+    orchestrator = ReportingOrchestrator()
+
+    execution = await orchestrator.transform_execution(created.execution_id)
+
+    assert execution.status == ExecutionStatus.TRANSFORMED.value
+    output_path = Path(execution.output_file_path)
+    assert output_path.exists()
+    assert "Fenergo ID" in output_path.read_text()
+
+    records = execution_service.list_file_processing(created.execution_id)
+    assert len(records) == 1
+    assert records[0].processing_step == "TRANSFORM"
+    assert records[0].status == "COMPLETED"
+    assert records[0].output_file_path == str(output_path)
+
+
+async def test_transform_execution_marks_failed_when_no_downloaded_file_path(db):
+    created = execution_service.create_execution("ChinaGTTReport")
+    orchestrator = ReportingOrchestrator()
+
+    with pytest.raises(ValueError):
+        await orchestrator.transform_execution(created.execution_id)
+
+    updated = execution_service.get_execution(created.execution_id)
+    assert updated.status == ExecutionStatus.FAILED.value
+    assert updated.failure_stage == "TRANSFORM"
+
+    records = execution_service.list_file_processing(created.execution_id)
+    assert len(records) == 1
+    assert records[0].status == "FAILED"
+
+
+# --- Utility flows: deliver_file (Flow: raw SFTP delivery, no report) ---
+
+
+def test_deliver_file_unlinked_returns_untracked_result_and_writes_no_db_rows(
+    db, tmp_path
+):
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("a,b\n1,2\n")
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    result = orchestrator.deliver_file(source_file)
+
+    assert isinstance(result, UtilityOperationResult)
+    assert result.execution_id is None
+    assert result.output_path == "success/arbitrary.csv"
+    assert len(delivery.deliver_calls) == 1
+    assert _all_executions() == []
+
+
+def test_deliver_file_linked_writes_deliver_file_processing_row(db, tmp_path):
+    execution = _seed_full_run_execution()
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("a,b\n1,2\n")
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    result = orchestrator.deliver_file(source_file, execution_id=execution.execution_id)
+
+    assert result.execution_id == execution.execution_id
+    assert result.output_path == "success/arbitrary.csv"
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert len(records) == 1
+    assert records[0].processing_step == "DELIVER"
+    assert records[0].status == "COMPLETED"
+    assert records[0].file_name == "arbitrary.csv"
+    # The linked execution's own report_execution row is untouched.
+    unchanged = execution_service.get_execution(execution.execution_id)
+    assert unchanged.status == ExecutionStatus.REQUEST_SUBMITTED.value
+
+
+def test_deliver_file_to_error_target(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "SFTP_ERROR_DIRECTORY", "error")
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("a,b\n1,2\n")
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    orchestrator.deliver_file(source_file, target="error")
+
+    assert delivery.deliver_calls[0][1] == "error"
+
+
+def test_deliver_file_linked_marks_failed_file_processing_on_error(
+    db, tmp_path, monkeypatch
+):
+    execution = _seed_full_run_execution()
+    monkeypatch.setattr(settings, "SFTP_ERROR_DIRECTORY", None)
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("a,b\n1,2\n")
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(DeliveryConfigError):
+        orchestrator.deliver_file(
+            source_file, target="error", execution_id=execution.execution_id
+        )
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert len(records) == 1
+    assert records[0].processing_step == "DELIVER"
+    assert records[0].status == "FAILED"
+
+
+def test_deliver_file_unlinked_writes_no_db_rows_on_error(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "SFTP_ERROR_DIRECTORY", None)
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("a,b\n1,2\n")
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(DeliveryConfigError):
+        orchestrator.deliver_file(source_file, target="error")
+
+    assert _all_executions() == []
+
+
+def test_deliver_file_raises_for_unknown_target(db, tmp_path):
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("a,b\n1,2\n")
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(ValueError):
+        orchestrator.deliver_file(source_file, target="nonsense")
+
+
+def test_deliver_file_raises_lookuperror_for_unknown_execution_id(db, tmp_path):
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("a,b\n1,2\n")
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(LookupError):
+        orchestrator.deliver_file(source_file, execution_id="does-not-exist")
+
+
+# --- Utility flows: generate_marker_for_file (Flow 3) ---
+
+
+def test_generate_marker_for_file_unlinked_returns_untracked_result_and_writes_no_db_rows(
+    db, tmp_path
+):
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("some,content\n1,2\n")
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    result = orchestrator.generate_marker_for_file(source_file)
+
+    assert isinstance(result, UtilityOperationResult)
+    assert result.execution_id is None
+    marker_path = source_file.with_suffix(source_file.suffix + ".mrk")
+    assert result.output_path == str(marker_path)
+    assert (
+        marker_path.read_text().strip()
+        == hashlib.sha256(source_file.read_bytes()).hexdigest()
+    )
+    assert len(delivery.deliver_calls) == 1
+    assert _all_executions() == []
+
+
+def test_generate_marker_for_file_linked_writes_marker_and_deliver_file_processing_rows(
+    db, tmp_path
+):
+    execution = _seed_full_run_execution()
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("some,content\n1,2\n")
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    result = orchestrator.generate_marker_for_file(
+        source_file, execution_id=execution.execution_id
+    )
+
+    assert result.execution_id == execution.execution_id
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert [r.processing_step for r in records] == ["MARKER", "DELIVER"]
+    assert all(r.status == "COMPLETED" for r in records)
+    marker_path = source_file.with_suffix(source_file.suffix + ".mrk")
+    assert records[0].checksum_value == marker_path.read_text().strip()
+
+
+def test_generate_marker_for_file_no_sftp_no_output_path_skips_delivery(db, tmp_path):
+    execution = _seed_full_run_execution()
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("some,content\n1,2\n")
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    result = orchestrator.generate_marker_for_file(
+        source_file, execution_id=execution.execution_id, sftp=False
+    )
+
+    assert delivery.deliver_calls == []
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert [r.processing_step for r in records] == ["MARKER"]
+    marker_path = source_file.with_suffix(source_file.suffix + ".mrk")
+    assert result.output_path == str(marker_path)
+
+
+def test_generate_marker_for_file_output_path_copies_locally(db, tmp_path):
+    execution = _seed_full_run_execution()
+    destination = tmp_path / "local_drop"
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("some,content\n1,2\n")
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    orchestrator.generate_marker_for_file(
+        source_file, execution_id=execution.execution_id, local_destination=destination
+    )
+
+    assert delivery.deliver_calls == []
+    marker_path = source_file.with_suffix(source_file.suffix + ".mrk")
+    assert (destination / marker_path.name).exists()
+    records = execution_service.list_file_processing(execution.execution_id)
+    deliver_record = next(r for r in records if r.processing_step == "DELIVER")
+    assert deliver_record.output_file_path == str(destination / marker_path.name)
+
+
+def test_generate_marker_for_file_sftp_true_and_output_path_together_raises(
+    db, tmp_path
+):
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("some,content\n1,2\n")
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(ValueError):
+        orchestrator.generate_marker_for_file(
+            source_file, sftp=True, local_destination=tmp_path / "out"
+        )
+
+
+def test_generate_marker_for_file_linked_writes_failed_file_processing_row_on_error(
+    db, tmp_path, monkeypatch
+):
+    execution = _seed_full_run_execution()
+    monkeypatch.setattr(settings, "SFTP_SUCCESS_DIRECTORY", None)
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("some,content\n1,2\n")
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(DeliveryConfigError):
+        orchestrator.generate_marker_for_file(
+            source_file, execution_id=execution.execution_id
+        )
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert [r.processing_step for r in records] == ["MARKER", "DELIVER"]
+    assert [r.status for r in records] == ["COMPLETED", "FAILED"]
+
+
+def test_generate_marker_for_file_unlinked_writes_no_db_rows_on_error(
+    db, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(settings, "SFTP_SUCCESS_DIRECTORY", None)
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("some,content\n1,2\n")
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(DeliveryConfigError):
+        orchestrator.generate_marker_for_file(source_file)
+
+    assert _all_executions() == []
+
+
+def test_generate_marker_for_file_raises_lookuperror_for_unknown_execution_id(
+    db, tmp_path
+):
+    source_file = tmp_path / "arbitrary.csv"
+    source_file.write_text("some,content\n1,2\n")
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(LookupError):
+        orchestrator.generate_marker_for_file(
+            source_file, execution_id="does-not-exist"
+        )
+
+
+# --- Utility flows: transform_existing_csv (Flow 2) ---
+
+
+async def test_transform_existing_csv_unlinked_returns_untracked_result_and_writes_no_db_rows(
+    db, tmp_path
+):
+    input_path = tmp_path / "existing.csv"
+    input_path.write_text(CHINA_GTT_CSV)
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    result = await orchestrator.transform_existing_csv("ChinaGTTReport", input_path)
+
+    assert isinstance(result, UtilityOperationResult)
+    assert result.execution_id is None
+    output_path = Path(result.output_path)
+    assert output_path.exists()
+    assert "Fenergo ID" in output_path.read_text()
+    marker_path = output_path.with_suffix(output_path.suffix + ".mrk")
+    assert marker_path.exists()
+    assert len(delivery.deliver_calls) == 2
+    assert _all_executions() == []
+
+
+async def test_transform_existing_csv_unlinked_respects_generate_marker_override_false(
+    db, tmp_path
+):
+    input_path = tmp_path / "existing.csv"
+    input_path.write_text(CHINA_GTT_CSV)
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    result = await orchestrator.transform_existing_csv(
+        "ChinaGTTReport", input_path, generate_marker=False
+    )
+
+    output_path = Path(result.output_path)
+    marker_path = output_path.with_suffix(output_path.suffix + ".mrk")
+    assert not marker_path.exists()
+    assert len(delivery.deliver_calls) == 1
+
+
+async def test_transform_existing_csv_unlinked_marker_file_missing_input_raises(
+    db, tmp_path
+):
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(FileNotFoundError):
+        await orchestrator.transform_existing_csv(
+            "ChinaGTTReport", tmp_path / "does-not-exist.csv"
+        )
+
+    assert _all_executions() == []
+
+
+async def test_transform_existing_csv_linked_writes_file_processing_rows(db, tmp_path):
+    execution = _seed_full_run_execution(report_name="ChinaGTTReport")
+    input_path = tmp_path / "existing.csv"
+    input_path.write_text(CHINA_GTT_CSV)
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    result = await orchestrator.transform_existing_csv(
+        "ChinaGTTReport", input_path, execution_id=execution.execution_id
+    )
+
+    assert result.execution_id == execution.execution_id
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert [r.processing_step for r in records] == [
+        "TRANSFORM",
+        "MARKER",
+        "DELIVER",
+        "DELIVER",
+    ]
+    assert all(r.status == "COMPLETED" for r in records)
+    # The linked execution's own report_execution row is untouched - re-processing
+    # is a file-level event, not a change to the original run's outcome.
+    unchanged = execution_service.get_execution(execution.execution_id)
+    assert unchanged.status == ExecutionStatus.REQUEST_SUBMITTED.value
+    assert unchanged.output_file_path is None
+
+
+async def test_transform_existing_csv_no_sftp_no_output_path_skips_delivery(
+    db, tmp_path
+):
+    execution = _seed_full_run_execution(report_name="ChinaGTTReport")
+    input_path = tmp_path / "existing.csv"
+    input_path.write_text(CHINA_GTT_CSV)
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    await orchestrator.transform_existing_csv(
+        "ChinaGTTReport", input_path, execution_id=execution.execution_id, sftp=False
+    )
+
+    assert delivery.deliver_calls == []
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert [r.processing_step for r in records] == ["TRANSFORM", "MARKER"]
+
+
+async def test_transform_existing_csv_output_path_copies_locally(db, tmp_path):
+    execution = _seed_full_run_execution(report_name="ChinaGTTReport")
+    destination = tmp_path / "local_drop"
+    input_path = tmp_path / "existing.csv"
+    input_path.write_text(CHINA_GTT_CSV)
+    delivery = FakeDeliveryService()
+    orchestrator = ReportingOrchestrator(delivery_service=delivery)
+
+    result = await orchestrator.transform_existing_csv(
+        "ChinaGTTReport",
+        input_path,
+        execution_id=execution.execution_id,
+        local_destination=destination,
+    )
+
+    assert delivery.deliver_calls == []
+    output_path = Path(result.output_path)
+    marker_path = output_path.with_suffix(output_path.suffix + ".mrk")
+    assert (destination / output_path.name).exists()
+    assert (destination / marker_path.name).exists()
+    records = execution_service.list_file_processing(execution.execution_id)
+    deliver_records = [r for r in records if r.processing_step == "DELIVER"]
+    assert len(deliver_records) == 2
+
+
+async def test_transform_existing_csv_sftp_true_and_output_path_together_raises(
+    db, tmp_path
+):
+    input_path = tmp_path / "existing.csv"
+    input_path.write_text(CHINA_GTT_CSV)
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(ValueError):
+        await orchestrator.transform_existing_csv(
+            "ChinaGTTReport", input_path, sftp=True, local_destination=tmp_path / "out"
+        )
+
+
+async def test_transform_existing_csv_linked_raises_on_report_name_mismatch(
+    db, tmp_path
+):
+    execution = _seed_full_run_execution(report_name="CANDERReport")
+    input_path = tmp_path / "existing.csv"
+    input_path.write_text(CHINA_GTT_CSV)
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(ValueError):
+        await orchestrator.transform_existing_csv(
+            "ChinaGTTReport", input_path, execution_id=execution.execution_id
+        )
+
+    assert execution_service.list_file_processing(execution.execution_id) == []
+
+
+async def test_transform_existing_csv_linked_writes_failed_file_processing_row_on_error(
+    db, tmp_path
+):
+    execution = _seed_full_run_execution(report_name="ChinaGTTReport")
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(FileNotFoundError):
+        await orchestrator.transform_existing_csv(
+            "ChinaGTTReport",
+            tmp_path / "does-not-exist.csv",
+            execution_id=execution.execution_id,
+        )
+
+    records = execution_service.list_file_processing(execution.execution_id)
+    assert len(records) == 1
+    assert records[0].processing_step == "TRANSFORM"
+    assert records[0].status == "FAILED"
+
+
+async def test_transform_existing_csv_raises_lookuperror_for_unknown_execution_id(
+    db, tmp_path
+):
+    input_path = tmp_path / "existing.csv"
+    input_path.write_text(CHINA_GTT_CSV)
+    orchestrator = ReportingOrchestrator(delivery_service=FakeDeliveryService())
+
+    with pytest.raises(LookupError):
+        await orchestrator.transform_existing_csv(
+            "ChinaGTTReport", input_path, execution_id="does-not-exist"
+        )
+
+
+def test_timestamp_is_date_only_no_time_component():
+    """2026-09-01: output/marker filenames switched to a date-only YYYYMMDD stamp,
+    matching the finalized reports' naming standard - see docs/decisions.md."""
+    value = ReportingOrchestrator._timestamp()
+    assert len(value) == 8
+    assert value.isdigit()
+    assert datetime.strptime(value, "%Y%m%d")
+
+
+async def test_output_filename_uses_date_only_timestamp(db):
+    orchestrator = ReportingOrchestrator(
+        fenergo_service=FakeFenergoService(),
+        download_service=FakeDownloadService(),
+        delivery_service=FakeDeliveryService(),
+    )
+
+    execution = await orchestrator.run_report("ChinaGTTReport")
+
+    output_path = Path(execution.output_file_path)
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    assert output_path.name == f"ChinaGTTReport_{today}.csv"
+
+
+def _all_executions():
+    return execution_service.list_executions()
+
+```
+
+assets/templates/CanadianDerivatives_OnboardingStatus.xml:
+
+```xml
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- Source=Target deliberately identical for now - real Target renames come later,
+     once transform is actually needed (see docs/decisions.md). -->
+<ExtractConfig ExtractType="CSV" DateFormat="M/d/yyyy h:mm:ss tt" MaxRetry="5">
+    <RecordTemplate>
+        <Column Assignment="1" Source="Fenergo ID" Target="Fenergo ID" DataType="String" />
+        <Column Assignment="2" Source="Legal Entity Type" Target="Legal Entity Type" DataType="String" />
+        <Column Assignment="3" Source="Legal Entity Name" Target="Legal Entity Name" DataType="String" />
+        <Column Assignment="4" Source="LEI" Target="LEI" DataType="String" />
+        <Column Assignment="5" Source="Associated Asset Manager" Target="Associated Asset Manager" DataType="String" />
+        <Column Assignment="6" Source="Regulatory Status" Target="Regulatory Status" DataType="String" />
+        <Column Assignment="7" Source="Canadian Reporting Requirements Completed" Target="Canadian Reporting Requirements Completed" DataType="String" />
+        <Column Assignment="8" Source="Canadian Person Representation" Target="Canadian Person Representation" DataType="String" />
+        <Column Assignment="9" Source="Country of Incorporation" Target="Country of Incorporation" DataType="String" />
+        <Column Assignment="10" Source="Principal Place of Business" Target="Principal Place of Business" DataType="String" />
+        <Column Assignment="11" Source="NonGBM or Agency Indicator" Target="NonGBM or Agency Indicator" DataType="String" />
+        <Column Assignment="12" Source="NonGBM or Agency Category" Target="NonGBM or Agency Category" DataType="String" />
+        <Column Assignment="13" Source="KYC Level" Target="KYC Level" DataType="String" />
+        <Column Assignment="14" Source="Data Source" Target="Data Source" DataType="String" />
+        <Column Assignment="15" Source="Markit Match ID" Target="Markit Match ID" DataType="String" />
+        <Column Assignment="16" Source="ISDA Amend" Target="ISDA Amend" DataType="String" />
+        <Column Assignment="17" Source="Bilateral Data Source" Target="Bilateral Data Source" DataType="String" />
+        <Column Assignment="18" Source="Canadian Representation Agreement" Target="Canadian Representation Agreement" DataType="String" />
+        <Column Assignment="19" Source="ISDA Status" Target="ISDA Status" DataType="String" />
+        <Column Assignment="20" Source="Jurisdiction of Incorporation_HO_PPB" Target="Jurisdiction of Incorporation_HO_PPB" DataType="String" />
+        <Column Assignment="21" Source="Registered Derivatives Dealer" Target="Registered Derivatives Dealer" DataType="String" />
+        <Column Assignment="22" Source="Province_RDD" Target="Province_RDD" DataType="String" />
+        <Column Assignment="23" Source="Canadian Affiliate" Target="Canadian Affiliate" DataType="String" />
+        <Column Assignment="24" Source="Province_Affiliate" Target="Province_Affiliate" DataType="String" />
+        <Column Assignment="25" Source="Additional Covenant Reporting" Target="Additional Covenant Reporting" DataType="String" />
+        <Column Assignment="26" Source="Province_AdditionalCovenantResponsibility" Target="Province_AdditionalCovenantResponsibility" DataType="String" />
+        <Column Assignment="27" Source="Consent to Disclosure" Target="Consent to Disclosure" DataType="String" />
+        <Column Assignment="28" Source="Reporting Party Rules" Target="Reporting Party Rules" DataType="String" />
+        <Column Assignment="29" Source="ISDA Master Agreement" Target="ISDA Master Agreement" DataType="String" />
+        <Column Assignment="30" Source="Multilateral Agreement For Dealers" Target="Multilateral Agreement For Dealers" DataType="String" />
+        <Column Assignment="31" Source="Clearing Exception" Target="Clearing Exception" DataType="String" />
+        <Column Assignment="32" Source="CAD PCA Principal Type" Target="CAD PCA Principal Type" DataType="String" />
+        <Column Assignment="33" Source="Consent to all Reporting Requirements" Target="Consent to all Reporting Requirements" DataType="String" />
+        <Column Assignment="34" Source="Above participant affiliate threshold" Target="Above participant affiliate threshold" DataType="String" />
+        <Column Assignment="35" Source="Above local counterparty threshold" Target="Above local counterparty threshold" DataType="String" />
+        <Column Assignment="36" Source="OTC Regulated Clearing Agency Participant" Target="OTC Regulated Clearing Agency Participant" DataType="String" />
+        <Column Assignment="37" Source="Crown Corporation Entity" Target="Crown Corporation Entity" DataType="String" />
+        <Column Assignment="38" Source="Approved Canadian Derivative Workflow" Target="Approved Canadian Derivative Workflow" DataType="String" />
+        <Column Assignment="39" Source="Latest Managerial Approval" Target="Latest Managerial Approval" DataType="String" />
+        <Column Assignment="40" Source="LE_AnyCompletedCANDERClassificationInCompletedCase" Target="LE_AnyCompletedCANDERClassificationInCompletedCase" DataType="String" />
+        <Column Assignment="41" Source="Cander_DeScope" Target="Cander_DeScope" DataType="String" />
+    </RecordTemplate>
+</ExtractConfig>
+
+```
+
+assets/templates/China_OnboardingStatus.xml:
+
+```xml
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- Source=Target deliberately identical for now - real Target renames come later,
+     once transform is actually needed (see docs/decisions.md). -->
+<ExtractConfig ExtractType="CSV" DateFormat="M/d/yyyy h:mm:ss tt" MaxRetry="5">
+    <RecordTemplate>
+        <Column Assignment="1" Source="Fenergo ID" Target="Fenergo ID" DataType="String" />
+        <Column Assignment="2" Source="Client Name" Target="Client Name" DataType="String" />
+        <Column Assignment="3" Source="LEI" Target="LEI" DataType="String" />
+        <Column Assignment="4" Source="Global Risk Rating" Target="Global Risk Rating" DataType="String" />
+        <Column Assignment="5" Source="Scheduled Review Date" Target="Scheduled Review Date" DataType="String" />
+        <Column Assignment="6" Source="China Risk Rating" Target="China Risk Rating" DataType="String" />
+        <Column Assignment="7" Source="China Risk Rating (Override)" Target="China Risk Rating (Override)" DataType="String" />
+        <Column Assignment="8" Source="China Next Review Date" Target="China Next Review Date" DataType="String" />
+        <Column Assignment="9" Source="China Next Review Date (Override)" Target="China Next Review Date (Override)" DataType="String" />
+        <Column Assignment="10" Source="China Comments" Target="China Comments" DataType="String" />
+        <Column Assignment="11" Source="Country of Incorporation" Target="Country of Incorporation" DataType="String" />
+        <Column Assignment="12" Source="Product Category" Target="Product Category" DataType="String" />
+        <Column Assignment="13" Source="Product Type" Target="Product Type" DataType="String" />
+        <Column Assignment="14" Source="Booking Entity" Target="Booking Entity" DataType="String" />
+        <Column Assignment="15" Source="Arranging Entity" Target="Arranging Entity" DataType="String" />
+        <Column Assignment="16" Source="Product ID" Target="Product ID" DataType="String" />
+    </RecordTemplate>
+</ExtractConfig>
+
+```
+
+assets/templates/Product_OnboardingStatus.xml:
+
+```xml
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- Placeholder - real CSV column headers for this report don't exist yet
+     (see docs/decisions.md). Zero columns parses fine (TemplateReader has no
+     minimum-column requirement) but transform() will produce an empty-header
+     CSV until real Source/Target columns are added here. -->
+<ExtractConfig ExtractType="CSV" DateFormat="M/d/yyyy h:mm:ss tt" MaxRetry="5">
+    <RecordTemplate>
+    </RecordTemplate>
+</ExtractConfig>
+
+```
+
+assets/templates/UK_Product_OnboardingStatus.xml:
+
+```xml
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- Source=Target deliberately identical for now - real Target renames come later,
+     once transform is actually needed (see docs/decisions.md). -->
+<ExtractConfig ExtractType="CSV" DateFormat="M/d/yyyy h:mm:ss tt" MaxRetry="5">
+    <RecordTemplate>
+        <Column Assignment="1" Source="FENERGO ID" Target="FENERGO ID" DataType="String" />
+        <Column Assignment="2" Source="Legal Entity Type" Target="Legal Entity Type" DataType="String" />
+        <Column Assignment="3" Source="Legal Entity Name" Target="Legal Entity Name" DataType="String" />
+        <Column Assignment="4" Source="LEI" Target="LEI" DataType="String" />
+        <Column Assignment="5" Source="Associated Asset Manager" Target="Associated Asset Manager" DataType="String" />
+        <Column Assignment="6" Source="Date of Terms of Business (UK)" Target="Date of Terms of Business (UK)" DataType="String" />
+        <Column Assignment="7" Source="Final Global Risk Rating" Target="Final Global Risk Rating" DataType="String" />
+        <Column Assignment="8" Source="Final UK Jurisdiction Risk Rating" Target="Final UK Jurisdiction Risk Rating" DataType="String" />
+        <Column Assignment="9" Source="Jurisdiction Next Review Date (Calc.)" Target="Jurisdiction Next Review Date (Calc.)" DataType="String" />
+    </RecordTemplate>
+</ExtractConfig>
+
 ```
