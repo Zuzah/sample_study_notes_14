@@ -1658,3 +1658,48 @@ assets/templates/UK_Product_OnboardingStatus.xml:
 </ExtractConfig>
 
 ```
+
+# new proudct
+
+
+assets/templates/Product_OnboardingStatus.xml:
+
+```xml
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- Source=Target deliberately identical for now - real Target renames come later,
+     once transform is actually needed (see docs/decisions.md). -->
+<ExtractConfig ExtractType="CSV" DateFormat="M/d/yyyy h:mm:ss tt" MaxRetry="5">
+    <RecordTemplate>
+        <Column Assignment="1" Source="Fenergo ID" Target="Fenergo ID" DataType="String" />
+        <Column Assignment="2" Source="Legal Entity Name" Target="Legal Entity Name" DataType="String" />
+        <Column Assignment="3" Source="LEI" Target="LEI" DataType="String" />
+        <Column Assignment="4" Source="Product ID" Target="Product ID" DataType="String" />
+        <Column Assignment="5" Source="Product Category" Target="Product Category" DataType="String" />
+        <Column Assignment="6" Source="Product Type" Target="Product Type" DataType="String" />
+        <Column Assignment="7" Source="Booking Entity" Target="Booking Entity" DataType="String" />
+        <Column Assignment="8" Source="Arranging Entity" Target="Arranging Entity" DataType="String" />
+        <Column Assignment="9" Source="Product Status" Target="Product Status" DataType="String" />
+        <Column Assignment="10" Source="Product_Index_Key" Target="Product_Index_Key" DataType="String" />
+        <Column Assignment="11" Source="Associated Asset Manager" Target="Associated Asset Manager" DataType="String" />
+        <Column Assignment="12" Source="Country of Incorporation" Target="Country of Incorporation" DataType="String" />
+        <Column Assignment="13" Source="Principal Place of Business" Target="Principal Place of Business" DataType="String" />
+        <Column Assignment="14" Source="Non-GBM or Agency Indicator" Target="Non-GBM or Agency Indicator" DataType="String" />
+        <Column Assignment="15" Source="Non-GBM or Agency Category" Target="Non-GBM or Agency Category" DataType="String" />
+        <Column Assignment="16" Source="KYC Level" Target="KYC Level" DataType="String" />
+        <Column Assignment="17" Source="US_Person_2013" Target="US_Person_2013" DataType="String" />
+        <Column Assignment="18" Source="US_Person_2020" Target="US_Person_2020" DataType="String" />
+        <Column Assignment="19" Source="US_Guarantee_2013" Target="US_Guarantee_2013" DataType="String" />
+        <Column Assignment="20" Source="US_Guarantee_2020" Target="US_Guarantee_2020" DataType="String" />
+        <Column Assignment="21" Source="US_Conduit_Affiliate_2013" Target="US_Conduit_Affiliate_2013" DataType="String" />
+        <Column Assignment="22" Source="US_NaturalPerson_Incorporated" Target="US_NaturalPerson_Incorporated" DataType="String" />
+        <Column Assignment="23" Source="Swaps_Through_US_Branch" Target="Swaps_Through_US_Branch" DataType="String" />
+        <Column Assignment="24" Source="Swaps_Through_Foreign_Branch" Target="Swaps_Through_Foreign_Branch" DataType="String" />
+        <Column Assignment="25" Source="US_Significant_Risk_Subsidiary" Target="US_Significant_Risk_Subsidiary" DataType="String" />
+        <Column Assignment="26" Source="SBS_Foreign_Branch" Target="SBS_Foreign_Branch" DataType="String" />
+        <Column Assignment="27" Source="Cander_Descope" Target="Cander_Descope" DataType="String" />
+        <Column Assignment="28" Source="DF_Descope" Target="DF_Descope" DataType="String" />
+        <Column Assignment="29" Source="EMIREA_Descope" Target="EMIREA_Descope" DataType="String" />
+        <Column Assignment="30" Source="MAS_Descope" Target="MAS_Descope" DataType="String" />
+    </RecordTemplate>
+</ExtractConfig>
+```
