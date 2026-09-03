@@ -1,6 +1,18 @@
 # sample_study_notes_14
 KYC Stuides
 
+About the app:
+
+Simple answer: Application-local, embedded runtime — not a globally-installed Python. In production/Docker, the exact Python interpreter (3.12.3) ships baked into the container image itself (FROM python:3.12.3-slim), self-contained and isolated from whatever Python (if any) exists on the host machine or Kubernetes node. Locally, it uses a per-project virtual environment (.venv), which similarly isolates all dependencies from any system-wide Python install.
+
+Is this better? Yes, and it's the standard/expected practice, not just a preference — for concrete reasons a technical interviewer would want to hear:
+
+Reproducibility — the exact interpreter version and every dependency's exact version are pinned per project, so it behaves identically on any machine, instead of drifting based on whatever's globally installed.
+Isolation — no version conflicts with other Python tools/apps on the same machine.
+Portability — the same container runs the same way on a laptop, in CI, or on a production K8s cluster, since nothing depends on the host's own Python.
+Safety — global Python installs are often relied on by the OS itself; installing/upgrading packages into it risks breaking unrelated system tooling. Isolating avoids that entirely.
+Relying on a globally-installed Python directly is generally considered a legacy/fragile pattern outside of quick personal scripts — worth stating plainly if asked, not hedging.
+
 
 ## dag
 
